@@ -565,6 +565,31 @@ def get_tokenizer(
 
 import regex as re
 
+_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+def _pretokenize_chunk(chunk):
+    """Pre-tokenize a single chunk and return a local count dict."""
+    local_counts = {}
+    for match in re.finditer(_PAT, chunk):
+        word = match.group(0)
+        if word in local_counts:
+            local_counts[word] += 1
+        else:
+            local_counts[word] = 1
+    return local_counts
+
+def _pretokenize_batch(chunks):
+    """Pre-tokenize a batch of chunks and return a single merged count dict."""
+    local_counts = {}
+    for chunk in chunks:
+        for match in re.finditer(_PAT, chunk):
+            word = match.group(0)
+            if word in local_counts:
+                local_counts[word] += 1
+            else:
+                local_counts[word] = 1
+    return local_counts
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -614,15 +639,31 @@ def run_train_bpe(
         for chunk in chunks:
             new_chunks.extend(chunk.split(special))
         chunks = new_chunks
+    # Filter out empty chunks
+    chunks = [c for c in chunks if c]
     #print(f"text is {text[0:500]}")
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    for chunk in chunks:
-        for match in re.finditer(PAT, chunk):
-            word = match.group(0)
-            if (word in count_table):
-                count_table[word] += 1
+    from tqdm import tqdm
+    from multiprocessing import Pool, cpu_count
+
+    # Use multiprocessing only when there are enough chunks to justify the overhead
+    if len(chunks) > 100:
+        num_workers = cpu_count()
+        # Batch chunks so each worker gets a reasonable amount of work
+        batch_size = max(1, len(chunks) // (num_workers * 4))
+        batches = [chunks[i:i+batch_size] for i in range(0, len(chunks), batch_size)]
+        print(f"Pre-tokenizing {len(chunks)} chunks in {len(batches)} batches using {num_workers} workers...")
+        with Pool(num_workers) as pool:
+            results = list(tqdm(pool.imap(_pretokenize_batch, batches), total=len(batches), desc="Pre-tokenization"))
+    else:
+        results = [_pretokenize_chunk(chunk) for chunk in tqdm(chunks, desc="Pre-tokenization")]
+
+    # Merge all local count tables
+    for local_counts in tqdm(results, desc="Merging count tables"):
+        for word, count in local_counts.items():
+            if word in count_table:
+                count_table[word] += count
             else:
-                count_table[word] = 1
+                count_table[word] = count
     #print(f"count table is {list(count_table.items())[0:10]}")
     # convert the keys of count_table from string to tuple of byte tokens
     count_table = {tuple(bytes([b]) for b in word.encode('utf-8')): count for word, count in count_table.items()}
@@ -631,19 +672,73 @@ def run_train_bpe(
     # In the merge step, we will iterative update the count_table and the vocab, and merge, according to the BPE algorithm.
     current_vocab_size = len(vocab)
     # Only merge until the vocab size is reached.
-    # in each step, compute the pairwise frequency, take the maximum 
-    # update the vocab and the count_table and merge. 
+    # Build pair frequencies ONCE, then update incrementally.
+    from tqdm import tqdm
+    num_merges = vocab_size - current_vocab_size
+    pbar = tqdm(total=num_merges, desc="BPE merges")
+
+    # Build initial pair frequencies and a reverse index (pair -> set of words containing it)
+    pair_freq = {}
+    pair_to_words = {}  # maps pair -> set of word_tuples that contain that pair
+    for word_tuple, count in count_table.items():
+        for i in range(len(word_tuple) - 1):
+            pair = (word_tuple[i], word_tuple[i+1])
+            pair_freq[pair] = pair_freq.get(pair, 0) + count
+            if pair not in pair_to_words:
+                pair_to_words[pair] = set()
+            pair_to_words[pair].add(word_tuple)
+
     while current_vocab_size < vocab_size:
-        # get the pairwise frequency
-        pair_freq = get_pair_frequency(count_table)
+        if not pair_freq:
+            break
         max_key = max(pair_freq.items(), key=lambda kv: (kv[1], kv[0]))[0]
-        # update the vocab, merge, and the count_table
-        vocab[current_vocab_size] = max_key[0] + max_key[1]
+        merged = max_key[0] + max_key[1]
+        vocab[current_vocab_size] = merged
         current_vocab_size += 1
         merge.append(max_key)
-        #print(f"count table before update:{list(count_table.items())[0:10]}")
-        count_table = update_count_table(count_table, max_key)  
-        #print(f"count table after update:{list(count_table.items())[0:10]}")
+
+        # Only process words that actually contain the merged pair
+        affected_words = list(pair_to_words.pop(max_key, set()))
+        del pair_freq[max_key]
+
+        for word_tuple in affected_words:
+            count = count_table.pop(word_tuple)
+
+            # Remove ALL old pairs for this word from pair_freq and pair_to_words
+            for i in range(len(word_tuple) - 1):
+                old_pair = (word_tuple[i], word_tuple[i+1])
+                if old_pair in pair_freq:
+                    pair_freq[old_pair] -= count
+                    if pair_freq[old_pair] <= 0:
+                        pair_freq.pop(old_pair, None)
+                if old_pair in pair_to_words:
+                    pair_to_words[old_pair].discard(word_tuple)
+
+            # Build new word tuple with the merge applied
+            new_word_tuple = []
+            i = 0
+            while i < len(word_tuple):
+                if i < len(word_tuple) - 1 and (word_tuple[i], word_tuple[i+1]) == max_key:
+                    new_word_tuple.append(merged)
+                    i += 2
+                else:
+                    new_word_tuple.append(word_tuple[i])
+                    i += 1
+            new_word_tuple = tuple(new_word_tuple)
+
+            # Add new word to count_table
+            count_table[new_word_tuple] = count
+
+            # Add ALL new pairs for the new word
+            for i in range(len(new_word_tuple) - 1):
+                new_pair = (new_word_tuple[i], new_word_tuple[i+1])
+                pair_freq[new_pair] = pair_freq.get(new_pair, 0) + count
+                if new_pair not in pair_to_words:
+                    pair_to_words[new_pair] = set()
+                pair_to_words[new_pair].add(new_word_tuple)
+
+        pbar.update(1)
+    pbar.close()
     print(f"final vocab is {list(vocab.items())[0:10]}")
     print(f"final merge is {merge[-10:]}")
     print(f"final count is {list(count_table.items())[0:10]}")
