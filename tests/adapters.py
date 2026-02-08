@@ -561,7 +561,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
 import regex as re
 
@@ -788,3 +788,139 @@ def update_count_table(count_table: dict[tuple[str], int], max_key: tuple[str, s
                 i += 1
         count_table_new[tuple(new_word_tuple)] = count
     return count_table_new
+
+
+
+
+import json
+
+def get_pre_tokenizer(text: str, special_tokens: list[str]) -> dict[str, int]:
+    chunks = [text]
+    for special in special_tokens:
+        new_chunks = []
+        for chunk in chunks:
+            new_chunks.extend(chunk.split(special))
+        chunks = new_chunks
+    # Filter out empty chunks
+    chunks = [c for c in chunks if c]
+    #print(f"text is {text[0:500]}")
+    from tqdm import tqdm
+    from multiprocessing import Pool, cpu_count
+
+    # Use multiprocessing only when there are enough chunks to justify the overhead
+    if len(chunks) > 100:
+        num_workers = cpu_count()
+        # Batch chunks so each worker gets a reasonable amount of work
+        batch_size = max(1, len(chunks) // (num_workers * 4))
+        batches = [chunks[i:i+batch_size] for i in range(0, len(chunks), batch_size)]
+        print(f"Pre-tokenizing {len(chunks)} chunks in {len(batches)} batches using {num_workers} workers...")
+        with Pool(num_workers) as pool:
+            results = list(tqdm(pool.imap(_pretokenize_batch, batches), total=len(batches), desc="Pre-tokenization"))
+    else:
+        results = [_pretokenize_chunk(chunk) for chunk in tqdm(chunks, desc="Pre-tokenization")]
+    return results
+
+class Tokenizer(object):
+    def __init__(self, 
+                 vocab: dict[int, bytes], 
+                 merges: list[tuple[bytes, bytes]], 
+                 special_tokens: list[str] | None = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        self.token2id = {v: k for k, v in vocab.items()}
+        # Build merge priority lookup for efficient encoding
+        self.merge_priority = {merge: i for i, merge in enumerate(merges)}
+        # Build special token regex (longer tokens first for greedy matching)
+        if self.special_tokens:
+            sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
+            escaped = [re.escape(s) for s in sorted_specials]
+            self._special_pat = re.compile("(" + "|".join(escaped) + ")")
+        else:
+            self._special_pat = None
+
+    @classmethod
+    def from_files(cls, 
+                   vocab_filepath: str, 
+                   merges_filepath: str, 
+                   special_tokens: list[str] | None = None):
+        with open(vocab_filepath, "r") as f:
+            vocab = json.load(f)
+        merges = []
+        with open(merges_filepath, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    merges.append((parts[0].encode("utf-8"), parts[1].encode("utf-8")))
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+    def _apply_merges(self, tokens: list[bytes]) -> list[bytes]:
+        """Apply BPE merges to a list of byte tokens, always picking the highest-priority merge first."""
+        while len(tokens) >= 2:
+            # Find the pair with the lowest merge rank (highest priority)
+            best_pair = None
+            best_rank = float('inf')
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                rank = self.merge_priority.get(pair)
+                if rank is not None and rank < best_rank:
+                    best_pair = pair
+                    best_rank = rank
+            if best_pair is None:
+                break
+            # Apply this merge everywhere in the token list
+            new_tokens = []
+            i = 0
+            while i < len(tokens):
+                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
+                    new_tokens.append(best_pair[0] + best_pair[1])
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+        return tokens
+
+    def encode(self, text: str) -> list[int]:
+        """Encode an input text into a sequence of token IDs."""
+        if not text:
+            return []
+
+        ids = []
+        special_token_bytes_set = {s.encode("utf-8") for s in self.special_tokens}
+
+        # Split text on special tokens, keeping them in the result
+        if self._special_pat:
+            parts = self._special_pat.split(text)
+        else:
+            parts = [text]
+
+        for part in parts:
+            if not part:
+                continue
+            part_bytes = part.encode("utf-8")
+            if part_bytes in special_token_bytes_set:
+                # Special token — emit its ID directly
+                ids.append(self.token2id[part_bytes])
+            else:
+                # Apply GPT-2 pre-tokenization regex
+                words = re.findall(_PAT, part)
+                for word in words:
+                    # Convert word to list of single-byte tokens
+                    word_tokens = [bytes([b]) for b in word.encode("utf-8")]
+                    # Apply BPE merges
+                    merged = self._apply_merges(word_tokens)
+                    # Map to IDs
+                    for token in merged:
+                        ids.append(self.token2id[token])
+        return ids
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Given an iterable of strings, lazily yield token IDs."""
+        for text in iterable:
+            yield from self.encode(text)
+    
+    def decode(self, ids: list[int]) -> str:
+        """Decode a sequence of token IDs into text."""
+        token_bytes = b"".join(self.vocab[id] for id in ids)
+        return token_bytes.decode("utf-8", errors="replace")
+    
