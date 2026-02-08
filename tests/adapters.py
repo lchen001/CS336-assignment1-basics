@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from heapq import merge
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+from pandas import merge
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -561,6 +563,7 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+import regex as re
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -589,4 +592,104 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    # initialize + pre-tokenization + merge
+    # 1. initialize the vocab and the merge.
+    num_tokens = 256 # the intialize 256 tokens
+    vocab = {i+num_tokens: token.encode('utf-8') for i, token in enumerate(special_tokens)}
+    for i in range(num_tokens):
+        vocab[i] = bytes([i])
+    merge = []
+    # 2. pre-tokenization
+    # In the pre-tokenization step, our goal is to construct 
+    # a count_table.
+    count_table = {}
+    #print(f"Reading input file from {input_path}")
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    # Split text on special tokens so they act as boundaries
+    chunks = [text]
+    for special in special_tokens:
+        new_chunks = []
+        for chunk in chunks:
+            new_chunks.extend(chunk.split(special))
+        chunks = new_chunks
+    #print(f"text is {text[0:500]}")
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    for chunk in chunks:
+        for match in re.finditer(PAT, chunk):
+            word = match.group(0)
+            if (word in count_table):
+                count_table[word] += 1
+            else:
+                count_table[word] = 1
+    #print(f"count table is {list(count_table.items())[0:10]}")
+    # convert the keys of count_table from string to tuple of byte tokens
+    count_table = {tuple(bytes([b]) for b in word.encode('utf-8')): count for word, count in count_table.items()}
+    print(f"count table after converting keys is {list(count_table.items())[0:10]}")
+    # 3. merge
+    # In the merge step, we will iterative update the count_table and the vocab, and merge, according to the BPE algorithm.
+    current_vocab_size = len(vocab)
+    # Only merge until the vocab size is reached.
+    # in each step, compute the pairwise frequency, take the maximum 
+    # update the vocab and the count_table and merge. 
+    while current_vocab_size < vocab_size:
+        # get the pairwise frequency
+        pair_freq = get_pair_frequency(count_table)
+        max_key = max(pair_freq.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        # update the vocab, merge, and the count_table
+        vocab[current_vocab_size] = max_key[0] + max_key[1]
+        current_vocab_size += 1
+        merge.append(max_key)
+        #print(f"count table before update:{list(count_table.items())[0:10]}")
+        count_table = update_count_table(count_table, max_key)  
+        #print(f"count table after update:{list(count_table.items())[0:10]}")
+    print(f"final vocab is {list(vocab.items())[0:10]}")
+    print(f"final merge is {merge[-10:]}")
+    print(f"final count is {list(count_table.items())[0:10]}")
+    return vocab, merge
+    #raise NotImplementedError
+
+def get_pair_frequency(count_table: dict[tuple[str], int]) -> dict[tuple[str, str], int]:
+    '''
+    Docstring for get_pair_frequency
+    
+    :param count_table: Description
+    :type count_table: dict[tuple[str], int]
+    :return: Description
+    :rtype: dict[tuple[str, str], int]
+    '''
+    pair_dict = {}
+    for word_tuple, count in count_table.items():
+        for i in range(len(word_tuple) - 1):
+            pair = (word_tuple[i], word_tuple[i+1])
+            if pair in pair_dict:
+                pair_dict[pair] += count
+            else:
+                pair_dict[pair] = count
+    return pair_dict
+
+def update_count_table(count_table: dict[tuple[str], int], max_key: tuple[str, str]) -> dict[tuple[str], int]:
+    '''
+    Docstring for update_count_table
+    
+    :param count_table: Description
+    :type count_table: dict[tuple[str], int]
+    :param max_key: Description
+    :type max_key: tuple[str, str]
+    :return: Description
+    :rtype: dict[tuple[str], int]
+    '''
+    count_table_new = {}
+    for word_tuple, count in count_table.items():
+        new_word_tuple = []
+        i = 0
+        while i < len(word_tuple):
+            if i < len(word_tuple) - 1 and (word_tuple[i], word_tuple[i+1]) == max_key:
+                new_word_tuple.append(max_key[0] + max_key[1])
+                i += 2
+            else:
+                new_word_tuple.append(word_tuple[i])
+                i += 1
+        count_table_new[tuple(new_word_tuple)] = count
+    return count_table_new
